@@ -5,7 +5,7 @@
 # Function to check if a command is successful
 check_success() {
     if [ $? -ne 0 ]; then
-        echo "Error: $1"
+        log "Error: $1"
         cleanup
         exit 1
     fi
@@ -18,25 +18,39 @@ log() {
 cleanup() {
     log "Cleaning up: Stopping and removing any active containers, volumes, network, and temporary files."
 
-    # Stop and remove containers if they are still running
     docker stop $OLD_PG_CONTAINER $NEW_PG_CONTAINER $DUMP_CONTAINER 2>/dev/null || true
-    docker rm $OLD_PG_CONTAINER $NEW_PG_CONTAINER $DUMP_CONTAINER 2>/dev/null || true
-
-    # Remove the dump volume and network if they exist
+    docker rm $OLD_PG_CONTAINER  $NEW_PG_CONTAINER $DUMP_CONTAINER 2>/dev/null || true
     docker volume rm $DUMP_VOLUME 2>/dev/null || true
     docker network rm $NETWORK_NAME 2>/dev/null || true
 
-    # Remove the temporary directory if it exists
-    if [ -d "$TEMP_DIR" ]; then
-        rm -rf "$TEMP_DIR"
-        log "Temporary directory cleaned up."
-    fi
+    [ -d "$TEMP_DIR" ] && rm -rf "$TEMP_DIR" && log "Temporary directory cleaned up."
 
     log "Cleanup completed."
 }
 
 # Trap errors and script exit for cleanup
 trap cleanup EXIT ERR SIGINT SIGTERM
+
+wait_for_postgres_ready() {
+    local container_name=$1
+    local retries=10
+    local wait_time=3
+    local attempt=0
+
+    log "Waiting for PostgreSQL container '$container_name' to be ready..."
+
+    until docker exec -i $container_name pg_isready -U $POSTGRES_USER > /dev/null 2>&1; do
+        attempt=$((attempt+1))
+        if [ $attempt -ge $retries ]; then
+            log "PostgreSQL container '$container_name' is not ready after $retries attempts."
+            exit 1
+        fi
+        log "PostgreSQL container '$container_name' is not ready yet. Retrying in $wait_time seconds... (Attempt $attempt)"
+        sleep $wait_time
+    done
+
+    log "PostgreSQL container '$container_name' is ready."
+}
 
 # Get script parameters
 DATA_DIR=$1
@@ -64,7 +78,6 @@ if [ ! -f ".env" ]; then
     exit 1
 fi
 
-# Load the environment variables
 log "Loading .env file..."
 set -o allexport
 source .env
@@ -81,11 +94,11 @@ fi
 NETWORK_NAME="pg_upgrade_net"
 OLD_PG_CONTAINER="pg_old_$CURR_PG_VERSION"
 NEW_PG_CONTAINER="pg_new_$NEW_PG_VERSION"
-DUMP_CONTAINER="pg_dump_ubuntu"
+DUMP_CONTAINER="pg_dump_container"
 DUMP_VOLUME="pg_dump_volume"
 DB_DUMP_FILE="/dump/db_dump.sql"
 
-# Step 1: Copy the content of the data directory to a temporary location (without changing ownership)
+# Step 1: Copy the content of the data directory to a temporary location
 log "Copying data directory to a temporary location..."
 cp -a "$DATA_DIR"/* "$TEMP_DIR/"
 check_success "Failed to copy the data directory to a temporary location."
@@ -103,86 +116,58 @@ docker run -d --name $OLD_PG_CONTAINER --network $NETWORK_NAME \
     postgres:$CURR_PG_VERSION
 check_success "Failed to start PostgreSQL $CURR_PG_VERSION container."
 
-# Step 3: Create a new Docker volume for the dump
+# Step 3: Wait for the PostgreSQL server to be ready
+wait_for_postgres_ready $OLD_PG_CONTAINER
+
+# Step 4: Create a new Docker volume for the dump
 log "Creating dump volume..."
 docker volume create $DUMP_VOLUME
 check_success "Failed to create dump volume."
 
-# Step 4: Start another container based on Ubuntu, install pg_dumpall for the new version, and create a dump
-log "Creating database dump container..."
+# Step 5: Start a PostgreSQL container for dumping
+log "Starting PostgreSQL container for dump..."
 docker run -d --name $DUMP_CONTAINER --network $NETWORK_NAME \
     -v $DUMP_VOLUME:/dump \
-    ubuntu:latest tail -f /dev/null
-check_success "Failed to start dump container."
-
-log "Adding PostgreSQL APT repository and installing PostgreSQL client $NEW_PG_VERSION in the dump container..."
-docker exec $DUMP_CONTAINER bash -c "apt-get update -y && apt-get install -y wget gnupg lsb-release"
-check_success "Failed to update and install required tools in the dump container."
-
-# Add PostgreSQL APT repository (for new versions)
-docker exec $DUMP_CONTAINER bash -c "echo 'deb http://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main' > /etc/apt/sources.list.d/pgdg.list"
-docker exec $DUMP_CONTAINER bash -c "wget -qO - https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add -"
-check_success "Failed to add PostgreSQL APT repository in the dump container."
-
-# Update package list and install the required PostgreSQL client version
-docker exec $DUMP_CONTAINER bash -c "apt-get update -y && apt-get install -y postgresql-client-$NEW_PG_VERSION"
-check_success "Failed to install PostgreSQL client $NEW_PG_VERSION."
+    -e POSTGRES_PASSWORD=$POSTGRES_PASSWORD \
+    postgres:$NEW_PG_VERSION tail -f /dev/null
+check_success "Failed to start PostgreSQL dump container."
 
 log "Creating a database dump using pg_dumpall..."
-docker exec $DUMP_CONTAINER pg_dumpall -h $OLD_PG_CONTAINER -U $POSTGRES_USER -f $DB_DUMP_FILE
+docker exec -e PGPASSWORD=$POSTGRES_PASSWORD -i $DUMP_CONTAINER pg_dumpall -h $OLD_PG_CONTAINER -U $POSTGRES_USER -f $DB_DUMP_FILE
 check_success "Failed to create database dump."
 
-# Step 5: Stop both containers but keep the network and dump volume
-log "Stopping PostgreSQL $CURR_PG_VERSION container..."
+# Step 6: Stop and remove the old Postgres container
+log "Stopping and removing PostgreSQL $CURR_PG_VERSION container..."
 docker stop $OLD_PG_CONTAINER
 docker rm $OLD_PG_CONTAINER
 check_success "Failed to stop and remove PostgreSQL $CURR_PG_VERSION container."
 
-log "Stopping dump container..."
-docker stop $DUMP_CONTAINER
-docker rm $DUMP_CONTAINER
-check_success "Failed to stop and remove dump container."
-
-# Step 6: Remove the content of the data directory
+# Step 7: Remove the content of the data directory
 log "Removing old data directory contents..."
 rm -rf "$DATA_DIR"/*
 check_success "Failed to remove old data directory contents."
 
-# Step 7: Start a new PostgreSQL container with the new version and import data from the dump
+# Step 8: Start a new PostgreSQL container with the new version and import data from the dump
 log "Starting PostgreSQL $NEW_PG_VERSION container..."
 docker run -d --name $NEW_PG_CONTAINER --network $NETWORK_NAME \
     -v "$DATA_DIR:/var/lib/postgresql/data" \
     -v $DUMP_VOLUME:/dump \
     -e POSTGRES_USER=$POSTGRES_USER \
     -e POSTGRES_PASSWORD=$POSTGRES_PASSWORD \
-    -e POSTGRES_DB=$POSTGRES_DB \
     postgres:$NEW_PG_VERSION
 check_success "Failed to start PostgreSQL $NEW_PG_VERSION container."
 
-log "Waiting for PostgreSQL $NEW_PG_VERSION container to start..."
-sleep 10
+wait_for_postgres_ready $NEW_PG_CONTAINER
 
 log "Restoring the dump into the new PostgreSQL instance..."
-docker exec -i $NEW_PG_CONTAINER psql -U $POSTGRES_USER -d $POSTGRES_DB -f $DB_DUMP_FILE
+docker exec -e PGPASSWORD=$POSTGRES_PASSWORD -i $NEW_PG_CONTAINER psql -U $POSTGRES_USER -f $DB_DUMP_FILE
 check_success "Failed to restore the dump into the new PostgreSQL instance."
 
-# Step 8: Reindex the database
+# Step 10: Reindex the database
 log "Reindexing the database..."
-docker exec -i $NEW_PG_CONTAINER psql -U $POSTGRES_USER -d $POSTGRES_DB -c "REINDEX DATABASE $POSTGRES_DB;"
+docker exec -e PGPASSWORD=$POSTGRES_PASSWORD -i $NEW_PG_CONTAINER psql -U $POSTGRES_USER -c "REINDEX SYSTEM;"
 check_success "Failed to reindex the database."
 
-# Step 9: Stop all running containers and clean up network and volumes
-log "Stopping PostgreSQL $NEW_PG_VERSION container..."
-docker stop $NEW_PG_CONTAINER
-docker rm $NEW_PG_CONTAINER
-check_success "Failed to stop and remove PostgreSQL $NEW_PG_VERSION container."
-
-log "Removing Docker network and dump volume..."
-docker network rm $NETWORK_NAME
-docker volume rm $DUMP_VOLUME
-check_success "Failed to remove Docker network and dump volume."
-
-# Step 10: Handle errors - restore the data directory if necessary
 log "Checking for errors during the process..."
 if [ $? -ne 0 ]; then
     log "An error occurred during the upgrade process. Restoring the data directory..."
@@ -193,10 +178,5 @@ if [ $? -ne 0 ]; then
 else
     log "Upgrade successful."
 fi
-
-# Cleanup temporary directory
-log "Cleaning up temporary directory..."
-rm -rf "$TEMP_DIR"
-check_success "Failed to clean up temporary directory."
 
 log "Script completed successfully."
