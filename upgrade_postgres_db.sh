@@ -6,6 +6,7 @@
 check_success() {
     if [ $? -ne 0 ]; then
         echo "Error: $1"
+        cleanup
         exit 1
     fi
 }
@@ -13,6 +14,29 @@ check_success() {
 log() {
     echo "$(date +'%Y-%m-%d %H:%M:%S') - $1"
 }
+
+cleanup() {
+    log "Cleaning up: Stopping and removing any active containers, volumes, network, and temporary files."
+
+    # Stop and remove containers if they are still running
+    docker stop $OLD_PG_CONTAINER $NEW_PG_CONTAINER $DUMP_CONTAINER 2>/dev/null || true
+    docker rm $OLD_PG_CONTAINER $NEW_PG_CONTAINER $DUMP_CONTAINER 2>/dev/null || true
+
+    # Remove the dump volume and network if they exist
+    docker volume rm $DUMP_VOLUME 2>/dev/null || true
+    docker network rm $NETWORK_NAME 2>/dev/null || true
+
+    # Remove the temporary directory if it exists
+    if [ -d "$TEMP_DIR" ]; then
+        rm -rf "$TEMP_DIR"
+        log "Temporary directory cleaned up."
+    fi
+
+    log "Cleanup completed."
+}
+
+# Trap errors and script exit for cleanup
+trap cleanup EXIT ERR SIGINT SIGTERM
 
 # Get script parameters
 DATA_DIR=$1
@@ -91,11 +115,17 @@ docker run -d --name $DUMP_CONTAINER --network $NETWORK_NAME \
     ubuntu:latest tail -f /dev/null
 check_success "Failed to start dump container."
 
-log "Installing PostgreSQL client $NEW_PG_VERSION in the dump container..."
-docker exec $DUMP_CONTAINER apt-get update -y
-check_success "Failed to update the package list in the dump container."
+log "Adding PostgreSQL APT repository and installing PostgreSQL client $NEW_PG_VERSION in the dump container..."
+docker exec $DUMP_CONTAINER bash -c "apt-get update -y && apt-get install -y wget gnupg lsb-release"
+check_success "Failed to update and install required tools in the dump container."
 
-docker exec $DUMP_CONTAINER apt-get install -y postgresql-client-$NEW_PG_VERSION
+# Add PostgreSQL APT repository (for new versions)
+docker exec $DUMP_CONTAINER bash -c "echo 'deb http://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main' > /etc/apt/sources.list.d/pgdg.list"
+docker exec $DUMP_CONTAINER bash -c "wget -qO - https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add -"
+check_success "Failed to add PostgreSQL APT repository in the dump container."
+
+# Update package list and install the required PostgreSQL client version
+docker exec $DUMP_CONTAINER bash -c "apt-get update -y && apt-get install -y postgresql-client-$NEW_PG_VERSION"
 check_success "Failed to install PostgreSQL client $NEW_PG_VERSION."
 
 log "Creating a database dump using pg_dumpall..."
