@@ -31,17 +31,17 @@ The PostgreSQL DB Upgrade is a utility that assists in migrating PostgreSQL data
 3. Run the script as root or with sudo:
 
    ```bash
-   sudo ./postgres_upgrade_recovery.sh <path_to_data_directory> <current_postgres_version> <new_postgres_version>
+   sudo ./upgrade_postgresql_db.sh <path_to_data_directory> <current_postgres_version> <new_postgres_version>
    ```
 
    - `<path_to_data_directory>`: Path to your PostgreSQL data directory.
-   - `<current_postgres_version>`: The current PostgreSQL version (e.g., `13`).
-   - `<new_postgres_version>`: The new PostgreSQL version to upgrade to (e.g., `14`).
+   - `<current_postgres_version>`: The current PostgreSQL version (e.g., `16`).
+   - `<new_postgres_version>`: The new PostgreSQL version to upgrade to (e.g., `17`).
 
 ### Example
 
 ```bash
-sudo ./postgres_upgrade_recovery.sh /var/lib/postgresql/data 13 14
+sudo ./upgrade_postgresql_db.sh /var/lib/postgresql/data 16 17
 ```
 
 ## Requirements and Limitations
