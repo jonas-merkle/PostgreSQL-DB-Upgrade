@@ -57,15 +57,12 @@ sudo ./upgrade_postgresql_db.sh /var/lib/postgresql/data 16 17
 
 ## License
 
-This script is licensed under the **GNU General Public License v3.0**.
+**License**: [GNU General Public License v3.0](./LICENSE)
+**Copyright** (C) 2024 [Jonas Merkle [JJM]](mailto:jonas@jjm.one?subject=%5BGitHub%5D%3A%20PostgreSQL%20DB%20Upgrade)
 
-Copyright (C) 2024 [Jonas Merkle [JJM]](mailto:jonas@jjm.one?subject=%5BGitHub%5D%3A%20PostgreSQL%20DB%20Upgrade)
+This software is licensed under the **GNU GPL v3**. You may redistribute and modify it under the terms of the GPLv3 or any later version.
 
-This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
-
-This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License along with this program. If not, see [https://www.gnu.org/licenses/gpl-3.0.en.html](https://www.gnu.org/licenses/gpl-3.0.en.html).
+It is distributed "as is", without warranty of any kind. See the [GPLv3](https://www.gnu.org/licenses/gpl-3.0.en.html) for details.
 
 ## Troubleshooting
 
