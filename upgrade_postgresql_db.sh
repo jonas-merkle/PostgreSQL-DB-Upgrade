@@ -261,7 +261,7 @@ check_cmd docker rm "$OLD_PG_CONTAINER"
 log "Clearing old PostgreSQL data directory (keeping mount point)..."
 find "$DATA_DIR" -mindepth 1 -exec rm -rf {} +
 # Small delay to avoid overlay/propagation race conditions on some kernels
-sleep 1
+sleep 10
 
 # Start NEW Postgres and mount dump volume
 log "Starting new PostgreSQL $NEW_PG_VERSION container..."
