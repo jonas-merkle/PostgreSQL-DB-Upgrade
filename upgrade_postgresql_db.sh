@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# PostgreSQL Docker Upgrade Script (no chmod/chown side-effects)
+# PostgreSQL Docker Upgrade Script
 #
-# Safely upgrades a PostgreSQL database from version A -> B using Docker.
-# Process:
-#   1) Validate args, environment, and host data directory (exists, mountable).
-#   2) Backup the current data dir to a temp location.
-#   3) Start OLD Postgres on the existing data; dump globals + all DBs.
-#   4) Stop OLD, clear contents (keep mount point), start NEW, restore dumps.
-#   5) Reindex, cleanup containers/network/temp files.
+# Safely upgrades a PostgreSQL database using Docker by dump/restore:
+#   1) Validate args, .env, Docker, and host data directory (no side effects).
+#   2) Snapshot backup to a temp folder.
+#   3) Run OLD version on existing data; dump globals + all DBs.
+#   4) Stop OLD, clear contents (keep mount), start NEW, restore dumps.
+#   5) Reindex; cleanup containers/network/temp files.
+#
+# - This script NEVER changes file ownership/permissions. If they look wrong,
+#   it exits with clear instructions on how to fix them yourself.
+#
+# - Optional: On SELinux systems, run with SELINUX_LABEL=true to add :Z to mounts.
 #
 # License Information:
 # Copyright (C) 2025 [Jonas Merkle [JJM]](mailto:jonas@jjm.one?subject=%5BGitHub%5D%3A%20PostgreSQL%20DB%20Upgrade)
@@ -43,11 +47,11 @@ if [[ -n "${DATA_DIR}" && "${DATA_DIR:0:1}" != "/" ]]; then
 fi
 
 # --- Config knobs ------------------------------------------------------------
-# On SELinux hosts (Fedora/RHEL/CentOS), set SELINUX_LABEL=true to add :Z
+# On SELinux hosts (Fedora/RHEL/CentOS), set SELINUX_LABEL=true to add :Z to bind mounts.
 SELINUX_LABEL=${SELINUX_LABEL:-false}
 
 # Default UID/GID used by the official postgres image is 999:999.
-# We don't change files; we only *check* and warn.
+# We DO NOT change ownership. We only check and warn/exit.
 EXPECTED_PG_UID="${EXPECTED_PG_UID:-999}"
 EXPECTED_PG_GID="${EXPECTED_PG_GID:-999}"
 
@@ -56,6 +60,17 @@ mount_opt_suffix(){
     printf ':Z'
   else
     printf ''
+  fi
+}
+
+# Compute the in-container PGDATA path/volume target for a given version
+pgdata_target_for_version(){
+  local ver="$1"
+  # Numeric compare; assumes simple major version integers
+  if (( ver >= 18 )); then
+    echo "/var/lib/postgresql/18/docker"
+  else
+    echo "/var/lib/postgresql/data"
   fi
 }
 
@@ -120,12 +135,11 @@ wait_for_pg(){
 
 # --- Host data dir checks (no changes are made) ------------------------------
 verify_host_datadir(){
-  # 1) Must exist (we do NOT create it for you to avoid side-effects)
+  # 1) Must exist (we do NOT create it to avoid side-effects)
   [[ -n "$DATA_DIR" ]] || die "Missing data directory argument."
   [[ -d "$DATA_DIR" ]] || die "Data directory '$DATA_DIR' does not exist. Create it and ensure proper ownership (see below)."
 
   # 2) Ownership sanity (common source of container startup failures)
-  #    We don't fix it; we inform and exit early.
   local uid gid
   uid="$(stat -c '%u' "$DATA_DIR" 2>/dev/null || echo unknown)"
   gid="$(stat -c '%g' "$DATA_DIR" 2>/dev/null || echo unknown)"
@@ -148,7 +162,6 @@ EOF
   fi
 
   # 3) Bind-mount preflight: ensure Docker can mount and write inside it.
-  #    We write a tiny probe file and remove it (keeps your tree clean).
   log "Probing Docker bind mount for $DATA_DIR..."
   local probe_cmd="touch /mnt/.probe.$$ && echo ok >/mnt/.probe.$$ && cat /mnt/.probe.$$ && rm -f /mnt/.probe.$$"
   if ! docker run --rm -v "${DATA_DIR}:/mnt$(mount_opt_suffix)" busybox sh -c "$probe_cmd" | grep -qx 'ok'; then
@@ -222,10 +235,12 @@ log "Backup completed and stored in $TEMP_DIR/pgdata"
 log "Creating isolated Docker network for upgrade..."
 check_cmd docker network create "$NETWORK_NAME"
 
-# Start OLD Postgres using the current data dir
-log "Starting old PostgreSQL $CURR_PG_VERSION container..."
+# --- Start OLD Postgres (mount to the OLD version's default in-container path) ---
+OLD_PGDATA_PATH="$(pgdata_target_for_version "$CURR_PG_VERSION")"
+log "Starting old PostgreSQL $CURR_PG_VERSION container (PGDATA=${OLD_PGDATA_PATH})..."
 check_cmd docker run -d --name "$OLD_PG_CONTAINER" --network "$NETWORK_NAME" \
-  -v "$DATA_DIR:/var/lib/postgresql/data$(mount_opt_suffix)" \
+  -v "$DATA_DIR:${OLD_PGDATA_PATH}$(mount_opt_suffix)" \
+  -e PGDATA="$OLD_PGDATA_PATH" \
   -e POSTGRES_USER="$POSTGRES_USER" \
   -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
   -e POSTGRES_DB="$POSTGRES_DB" \
@@ -261,13 +276,15 @@ check_cmd docker rm "$OLD_PG_CONTAINER"
 log "Clearing old PostgreSQL data directory (keeping mount point)..."
 find "$DATA_DIR" -mindepth 1 -exec rm -rf {} +
 # Small delay to avoid overlay/propagation race conditions on some kernels
-sleep 10
+sleep 1
 
-# Start NEW Postgres and mount dump volume
-log "Starting new PostgreSQL $NEW_PG_VERSION container..."
+# --- Start NEW Postgres (mount to the NEW version's default PGDATA path) ---
+NEW_PGDATA_PATH="$(pgdata_target_for_version "$NEW_PG_VERSION")"
+log "Starting new PostgreSQL $NEW_PG_VERSION container (PGDATA=${NEW_PGDATA_PATH})..."
 check_cmd docker run -d --name "$NEW_PG_CONTAINER" --network "$NETWORK_NAME" \
-  -v "$DATA_DIR:/var/lib/postgresql/data$(mount_opt_suffix)" \
+  -v "$DATA_DIR:${NEW_PGDATA_PATH}$(mount_opt_suffix)" \
   -v "$DUMP_VOLUME:/dump" \
+  -e PGDATA="$NEW_PGDATA_PATH" \
   -e POSTGRES_USER="$POSTGRES_USER" \
   -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
   "postgres:${NEW_PG_VERSION}"
