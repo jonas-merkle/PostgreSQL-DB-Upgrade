@@ -1,118 +1,102 @@
 #!/usr/bin/env bash
-
-# PostgreSQL DB Upgrade
-# Copyright (C) 2024 [Jonas Merkle [JJM]](mailto:jonas@jjm.one?subject=%5BGitHub%5D%3A%20PostgreSQL%20DB%20Upgrade)
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program. If not, see <https://www.gnu.org/licenses/>.
-
-# PostgreSQL Upgrade Script: Migrates data from one version to another using Docker.
-# This script must be run as root or with sudo to ensure proper permissions.
-
-
 # ---------------------------------------------------------------------------
-# PostgreSQL Docker Upgrade Script
+# PostgreSQL Docker Upgrade Script (no chmod/chown side-effects)
 #
-# Safely upgrades a PostgreSQL database from version N to N+1 using Docker.
-# The process:
-#   1. Validate environment and arguments.
-#   2. Back up current data directory.
-#   3. Spin up old version in Docker to dump all databases.
-#   4. Stop old version, start new version, and restore data.
-#   5. Clean up containers, network, and temporary files.
+# Safely upgrades a PostgreSQL database from version A -> B using Docker.
+# Process:
+#   1) Validate args, environment, and host data directory (exists, mountable).
+#   2) Backup the current data dir to a temp location.
+#   3) Start OLD Postgres on the existing data; dump globals + all DBs.
+#   4) Stop OLD, clear contents (keep mount point), start NEW, restore dumps.
+#   5) Reindex, cleanup containers/network/temp files.
 #
-# Key Safety Features:
-#   - Absolute paths to avoid "No such file or directory" from relative paths.
-#   - Non-recursive error handling (no infinite loops on failure).
-#   - Rollback: restores data only once if something breaks.
-#   - Robust copy using rsync (handles empty dirs gracefully).
+# Key Safety/UX:
+#   - No recursive error loops; single rollback attempt on failure.
+#   - No ownership/permission changes are performed.
+#   - If the host data dir likely needs ownership/label fixes, we EXIT
+#     early with explicit, actionable instructions.
+#   - Optional SELinux relabel :Z via SELINUX_LABEL=true.
 # ---------------------------------------------------------------------------
 
-set -Eeuo pipefail  # Exit on errors, unset vars, or failed pipes
+set -Eeuo pipefail
 
-# --- Logging function --------------------------------------------------------
-log() {
-  printf '%s - %s\n' "$(date +'%Y-%m-%d %H:%M:%S')" "$*"
-}
+log(){ printf '%s - %s\n' "$(date +'%Y-%m-%d %H:%M:%S')" "$*"; }
+die(){ log "Error: $*"; exit 1; }
 
 # --- Arguments ---------------------------------------------------------------
 DATA_DIR="${1:-}"
 CURR_PG_VERSION="${2:-}"
 NEW_PG_VERSION="${3:-}"
 
-# Resolve DATA_DIR to absolute path (avoids relative path errors)
-if [[ -n "$DATA_DIR" && "${DATA_DIR:0:1}" != "/" ]]; then
+# Resolve to absolute path to avoid surprises with ../ etc.
+if [[ -n "${DATA_DIR}" && "${DATA_DIR:0:1}" != "/" ]]; then
   DATA_DIR="$(readlink -f "$DATA_DIR")"
 fi
 
-# --- Global working vars -----------------------------------------------------
-TEMP_DIR="$(mktemp -d)"  # Temporary dir for backup
-BACKUP_TAKEN=0           # Flag to indicate backup success
-RESTORE_ATTEMPTED=0      # Prevent multiple restores
+# --- Config knobs ------------------------------------------------------------
+# On SELinux hosts (Fedora/RHEL/CentOS), set SELINUX_LABEL=true to add :Z
+SELINUX_LABEL=${SELINUX_LABEL:-false}
 
-# Unique names for containers and volumes to avoid collisions
+# Default UID/GID used by the official postgres image is 999:999.
+# We don't change files; we only *check* and warn.
+EXPECTED_PG_UID="${EXPECTED_PG_UID:-999}"
+EXPECTED_PG_GID="${EXPECTED_PG_GID:-999}"
+
+mount_opt_suffix(){
+  if [[ "$SELINUX_LABEL" == "true" ]]; then
+    printf ':Z'
+  else
+    printf ''
+  fi
+}
+
+# --- Runtime names -----------------------------------------------------------
+TEMP_DIR="$(mktemp -d)"
+BACKUP_TAKEN=0
+RESTORE_ATTEMPTED=0
+
 NETWORK_NAME="pg_upgrade_net_$RANDOM"
 OLD_PG_CONTAINER="pg_old_${CURR_PG_VERSION}_$RANDOM"
 NEW_PG_CONTAINER="pg_new_${NEW_PG_VERSION}_$RANDOM"
 DUMP_CONTAINER="pg_dump_container_$RANDOM"
 DUMP_VOLUME="pg_dump_volume_$RANDOM"
 
-# Paths inside dump container
 DB_DUMP_FILE="/dump/db_dump.sql"
 GLOBAL_DUMP_FILE="/dump/globals.sql"
 
-# --- Helper functions --------------------------------------------------------
-
-die() { log "Error: $*"; exit 1; }
-
-# Cleanup function runs on EXIT (normal or error)
-cleanup() {
+# --- Helpers -----------------------------------------------------------------
+cleanup(){
   log "Cleaning up Docker containers, network, and temp files..."
   docker stop "$OLD_PG_CONTAINER" "$NEW_PG_CONTAINER" "$DUMP_CONTAINER" >/dev/null 2>&1 || true
-  docker rm "$OLD_PG_CONTAINER" "$NEW_PG_CONTAINER" "$DUMP_CONTAINER" >/dev/null 2>&1 || true
+  docker rm   "$OLD_PG_CONTAINER" "$NEW_PG_CONTAINER" "$DUMP_CONTAINER" >/dev/null 2>&1 || true
   docker volume rm "$DUMP_VOLUME" >/dev/null 2>&1 || true
   docker network rm "$NETWORK_NAME" >/dev/null 2>&1 || true
   [[ -d "$TEMP_DIR" ]] && rm -rf "$TEMP_DIR"
   log "Cleanup completed."
 }
 
-# Restores original data directory from backup (runs once if backup exists)
-restore_from_backup_once() {
+restore_from_backup_once(){
   if (( BACKUP_TAKEN == 1 )) && (( RESTORE_ATTEMPTED == 0 )); then
     RESTORE_ATTEMPTED=1
     log "Restoring data directory from backup..."
-    mkdir -p "$DATA_DIR"
-    # Remove all files in target dir, but keep directory itself
+    # Keep mount point; repopulate contents from backup snapshot
     find "$DATA_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
     rsync -a --delete "$TEMP_DIR/pgdata/" "$DATA_DIR/" || die "Failed to restore from backup."
     log "Data directory restored successfully."
   fi
 }
 
-# Error handler (runs automatically on ERR)
-on_error() {
+on_error(){
   local exit_code=$?
   local line=${BASH_LINENO[0]:-?}
-  log "A failure occurred near line $line. Starting rollback (if backup available)..."
+  log "A failure occurred near line $line. Rolling back if possible…"
   restore_from_backup_once
   exit $exit_code
 }
 
-# Wrapper for commands — stops script if command fails
-check_cmd() { "$@" || die "Command failed: $*"; }
+check_cmd(){ "$@" || die "Command failed: $*"; }
 
-# Waits for PostgreSQL container to be ready using pg_isready
-wait_for_pg() {
+wait_for_pg(){
   local container="$1" user="$2" retries=20 delay=3
   log "Waiting for PostgreSQL in container '$container' to start..."
   for ((i=1;i<=retries;i++)); do
@@ -125,30 +109,76 @@ wait_for_pg() {
   die "PostgreSQL in '$container' failed to start after $((retries*delay)) seconds."
 }
 
+# --- Host data dir checks (no changes are made) ------------------------------
+verify_host_datadir(){
+  # 1) Must exist (we do NOT create it for you to avoid side-effects)
+  [[ -n "$DATA_DIR" ]] || die "Missing data directory argument."
+  [[ -d "$DATA_DIR" ]] || die "Data directory '$DATA_DIR' does not exist. Create it and ensure proper ownership (see below)."
+
+  # 2) Ownership sanity (common source of container startup failures)
+  #    We don't fix it; we inform and exit early.
+  local uid gid
+  uid="$(stat -c '%u' "$DATA_DIR" 2>/dev/null || echo unknown)"
+  gid="$(stat -c '%g' "$DATA_DIR" 2>/dev/null || echo unknown)"
+  if [[ "$uid" != "$EXPECTED_PG_UID" || "$gid" != "$EXPECTED_PG_GID" ]]; then
+    cat <<EOF
+$(date +'%Y-%m-%d %H:%M:%S') - Warning: '$DATA_DIR' is owned by UID:GID ${uid}:${gid}, not ${EXPECTED_PG_UID}:${EXPECTED_PG_GID}.
+This often prevents 'postgres:${NEW_PG_VERSION}' from starting when the directory is bind-mounted.
+
+How to fix:
+  sudo chown ${EXPECTED_PG_UID}:${EXPECTED_PG_GID} "$DATA_DIR"
+
+If you're on SELinux (Fedora/RHEL/CentOS), you may also need to relabel the path:
+  (Option A) Add :Z to the mount (set SELINUX_LABEL=true when running this script)
+  (Option B) Or label the directory manually:
+      sudo chcon -Rt svirt_sandbox_file_t "$DATA_DIR"
+
+No changes were made. Exiting to prevent partial upgrades.
+EOF
+    exit 1
+  fi
+
+  # 3) Bind-mount preflight: ensure Docker can mount and write inside it.
+  #    We write a tiny probe file and remove it (keeps your tree clean).
+  log "Probing Docker bind mount for $DATA_DIR..."
+  local probe_cmd="touch /mnt/.probe.$$ && echo ok >/mnt/.probe.$$ && cat /mnt/.probe.$$ && rm -f /mnt/.probe.$$"
+  if ! docker run --rm -v "${DATA_DIR}:/mnt$(mount_opt_suffix)" busybox sh -c "$probe_cmd" | grep -qx 'ok'; then
+    cat <<EOF
+$(date +'%Y-%m-%d %H:%M:%S') - Error: Docker could not bind-mount '$DATA_DIR' for read/write access.
+
+Troubleshooting tips:
+  - Verify permissions and ownership: expecting UID:GID ${EXPECTED_PG_UID}:${EXPECTED_PG_GID}
+  - On SELinux systems, try again with: SELINUX_LABEL=true sudo ./upgrade_postgresql_db.sh ...
+  - Ensure the path is a real directory (not a broken symlink) and your Docker daemon
+    has access to the parent path (Docker Desktop file-sharing, or daemon permissions).
+
+No changes were made. Exiting to prevent partial upgrades.
+EOF
+    exit 1
+  fi
+  log "Bind mount probe succeeded."
+}
+
 # --- Traps -------------------------------------------------------------------
 trap on_error ERR
 trap cleanup EXIT
 
-# --- Main script logic -------------------------------------------------------
-
+# --- Main --------------------------------------------------------------------
 log "Starting PostgreSQL upgrade script..."
 
-# Must be root or use sudo to ensure file and Docker access
+# Privilege check (Docker + filesystem operations generally need root)
 if [[ "$EUID" -ne 0 ]]; then
   die "Please run this script as root or with sudo."
 fi
 
-# Validate arguments
+# Validate args
 if [[ -z "$DATA_DIR" || -z "$CURR_PG_VERSION" || -z "$NEW_PG_VERSION" ]]; then
   die "Usage: $0 <path_to_data_directory> <current_pg_version> <new_pg_version>"
 fi
 
-# Ensure data directory exists
-[[ -d "$DATA_DIR" ]] || die "Data directory '$DATA_DIR' not found."
-
-# Load environment variables from .env (required for DB credentials)
+# .env must exist in CWD and define creds
 if [[ ! -f ".env" ]]; then
-  die ".env file not found in $(pwd). Expected POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB."
+  die ".env not found in $(pwd). Expected POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB."
 fi
 
 log "Loading .env file..."
@@ -157,55 +187,55 @@ set -o allexport
 source .env
 set +o allexport
 
-# Ensure required variables are loaded
 [[ -n "${POSTGRES_USER:-}" && -n "${POSTGRES_PASSWORD:-}" && -n "${POSTGRES_DB:-}" ]] \
-  || die "Missing one or more required vars: POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB"
+  || die "Missing required vars in .env: POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB"
 
-# Check Docker is installed and running
-command -v docker >/dev/null 2>&1 || die "Docker command not found."
+# Docker sanity
+command -v docker >/dev/null 2>&1 || die "Docker not found in PATH."
 check_cmd docker info >/dev/null 2>&1
 
-# Pull required PostgreSQL Docker images
+# Verify host data dir (exists, expected ownership, mountable)
+verify_host_datadir
+
+# Pull images early (fail fast if unavailable)
 log "Pulling docker images for PostgreSQL $CURR_PG_VERSION and $NEW_PG_VERSION..."
 check_cmd docker pull "postgres:${CURR_PG_VERSION}"
 check_cmd docker pull "postgres:${NEW_PG_VERSION}"
 
-# Step 1: Backup existing data safely
+# Backup current data (snapshot to temp)
 log "Backing up existing PostgreSQL data..."
 mkdir -p "$TEMP_DIR/pgdata"
-# Use rsync to copy data safely (handles empty dirs gracefully)
 rsync -a --delete --ignore-missing-args "$DATA_DIR/" "$TEMP_DIR/pgdata/"
 BACKUP_TAKEN=1
 log "Backup completed and stored in $TEMP_DIR/pgdata"
 
-# Step 2: Create a temporary Docker network (isolates containers)
+# Isolated network
 log "Creating isolated Docker network for upgrade..."
 check_cmd docker network create "$NETWORK_NAME"
 
-# Step 3: Run the OLD Postgres container using the current data directory
+# Start OLD Postgres using the current data dir
 log "Starting old PostgreSQL $CURR_PG_VERSION container..."
 check_cmd docker run -d --name "$OLD_PG_CONTAINER" --network "$NETWORK_NAME" \
-  -v "$DATA_DIR:/var/lib/postgresql/data" \
+  -v "$DATA_DIR:/var/lib/postgresql/data$(mount_opt_suffix)" \
   -e POSTGRES_USER="$POSTGRES_USER" \
   -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
   -e POSTGRES_DB="$POSTGRES_DB" \
   "postgres:${CURR_PG_VERSION}"
 
-# Step 4: Wait for it to be ready
+# Wait for readiness
 wait_for_pg "$OLD_PG_CONTAINER" "$POSTGRES_USER"
 
-# Step 5: Create a volume to store dumps
+# Dump volume + helper container (uses NEW image tools)
 log "Creating Docker volume for dumps..."
 check_cmd docker volume create "$DUMP_VOLUME" >/dev/null
 
-# Step 6: Run a helper (new version) container that will perform pg_dumpall
 log "Starting helper container for dumps..."
 check_cmd docker run -d --name "$DUMP_CONTAINER" --network "$NETWORK_NAME" \
   -v "$DUMP_VOLUME:/dump" \
   -e PGPASSWORD="$POSTGRES_PASSWORD" \
   "postgres:${NEW_PG_VERSION}" tail -f /dev/null
 
-# Step 7: Dump globals (roles, etc.) and all databases
+# Create dumps: globals then everything
 log "Dumping global roles and database data..."
 check_cmd docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" -i "$DUMP_CONTAINER" \
   pg_dumpall -h "$OLD_PG_CONTAINER" -U "$POSTGRES_USER" -g -f "$GLOBAL_DUMP_FILE"
@@ -213,28 +243,30 @@ check_cmd docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" -i "$DUMP_CONTAINER" \
 check_cmd docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" -i "$DUMP_CONTAINER" \
   pg_dumpall -h "$OLD_PG_CONTAINER" -U "$POSTGRES_USER" -f "$DB_DUMP_FILE"
 
-# Step 8: Stop and remove old container
+# Stop/remove old container
 log "Stopping and removing old PostgreSQL container..."
 check_cmd docker stop "$OLD_PG_CONTAINER"
 check_cmd docker rm "$OLD_PG_CONTAINER"
 
-# Step 9: Wipe the old data directory (keep mount point)
-log "Clearing old PostgreSQL data directory..."
-find "$DATA_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+# Clear contents of the data dir (keep mount point)
+log "Clearing old PostgreSQL data directory (keeping mount point)..."
+find "$DATA_DIR" -mindepth 1 -exec rm -rf {} +
+# Small delay to avoid overlay/propagation race conditions on some kernels
+sleep 1
 
-# Step 10: Start the NEW PostgreSQL container
+# Start NEW Postgres and mount dump volume
 log "Starting new PostgreSQL $NEW_PG_VERSION container..."
 check_cmd docker run -d --name "$NEW_PG_CONTAINER" --network "$NETWORK_NAME" \
-  -v "$DATA_DIR:/var/lib/postgresql/data" \
+  -v "$DATA_DIR:/var/lib/postgresql/data$(mount_opt_suffix)" \
   -v "$DUMP_VOLUME:/dump" \
   -e POSTGRES_USER="$POSTGRES_USER" \
   -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
   "postgres:${NEW_PG_VERSION}"
 
-# Step 11: Wait until the new instance is ready
+# Wait for readiness
 wait_for_pg "$NEW_PG_CONTAINER" "$POSTGRES_USER"
 
-# Step 12: Restore globals (roles, permissions) and database data
+# Restore globals and databases
 log "Restoring global roles and permissions..."
 check_cmd docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" -i "$NEW_PG_CONTAINER" \
   psql -U "$POSTGRES_USER" -f "$GLOBAL_DUMP_FILE"
@@ -243,7 +275,7 @@ log "Restoring databases..."
 check_cmd docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" -i "$NEW_PG_CONTAINER" \
   psql -U "$POSTGRES_USER" -f "$DB_DUMP_FILE"
 
-# Step 13: Reindex system catalogs for new version
+# Reindex system catalogs
 log "Reindexing system catalogs..."
 check_cmd docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" -i "$NEW_PG_CONTAINER" \
   psql -U "$POSTGRES_USER" -c "REINDEX SYSTEM;"
