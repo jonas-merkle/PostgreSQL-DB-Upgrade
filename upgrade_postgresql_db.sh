@@ -10,12 +10,21 @@
 #   4) Stop OLD, clear contents (keep mount point), start NEW, restore dumps.
 #   5) Reindex, cleanup containers/network/temp files.
 #
-# Key Safety/UX:
-#   - No recursive error loops; single rollback attempt on failure.
-#   - No ownership/permission changes are performed.
-#   - If the host data dir likely needs ownership/label fixes, we EXIT
-#     early with explicit, actionable instructions.
-#   - Optional SELinux relabel :Z via SELINUX_LABEL=true.
+# License Information:
+# Copyright (C) 2025 [Jonas Merkle [JJM]](mailto:jonas@jjm.one?subject=%5BGitHub%5D%3A%20PostgreSQL%20DB%20Upgrade)
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
 # ---------------------------------------------------------------------------
 
 set -Eeuo pipefail
