@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # PostgreSQL DB Upgrade
 # Copyright (C) 2024 [Jonas Merkle [JJM]](mailto:jonas@jjm.one?subject=%5BGitHub%5D%3A%20PostgreSQL%20DB%20Upgrade)
@@ -19,192 +19,234 @@
 # PostgreSQL Upgrade Script: Migrates data from one version to another using Docker.
 # This script must be run as root or with sudo to ensure proper permissions.
 
-# Function to log messages with timestamps
+
+# ---------------------------------------------------------------------------
+# PostgreSQL Docker Upgrade Script
+#
+# Safely upgrades a PostgreSQL database from version N to N+1 using Docker.
+# The process:
+#   1. Validate environment and arguments.
+#   2. Back up current data directory.
+#   3. Spin up old version in Docker to dump all databases.
+#   4. Stop old version, start new version, and restore data.
+#   5. Clean up containers, network, and temporary files.
+#
+# Key Safety Features:
+#   - Absolute paths to avoid "No such file or directory" from relative paths.
+#   - Non-recursive error handling (no infinite loops on failure).
+#   - Rollback: restores data only once if something breaks.
+#   - Robust copy using rsync (handles empty dirs gracefully).
+# ---------------------------------------------------------------------------
+
+set -Eeuo pipefail  # Exit on errors, unset vars, or failed pipes
+
+# --- Logging function --------------------------------------------------------
 log() {
-    echo "$(date +'%Y-%m-%d %H:%M:%S') - $1"
+  printf '%s - %s\n' "$(date +'%Y-%m-%d %H:%M:%S')" "$*"
 }
 
-# Function to check if the last command was successful
-check_success() {
-    if [ $? -ne 0 ]; then
-        log "Error: $1"
-        restore_data_directory
-        cleanup
-        exit 1
-    fi
-}
+# --- Arguments ---------------------------------------------------------------
+DATA_DIR="${1:-}"
+CURR_PG_VERSION="${2:-}"
+NEW_PG_VERSION="${3:-}"
 
-# Cleanup function to stop and remove any active containers, volumes, networks, and temporary files
+# Resolve DATA_DIR to absolute path (avoids relative path errors)
+if [[ -n "$DATA_DIR" && "${DATA_DIR:0:1}" != "/" ]]; then
+  DATA_DIR="$(readlink -f "$DATA_DIR")"
+fi
+
+# --- Global working vars -----------------------------------------------------
+TEMP_DIR="$(mktemp -d)"  # Temporary dir for backup
+BACKUP_TAKEN=0           # Flag to indicate backup success
+RESTORE_ATTEMPTED=0      # Prevent multiple restores
+
+# Unique names for containers and volumes to avoid collisions
+NETWORK_NAME="pg_upgrade_net_$RANDOM"
+OLD_PG_CONTAINER="pg_old_${CURR_PG_VERSION}_$RANDOM"
+NEW_PG_CONTAINER="pg_new_${NEW_PG_VERSION}_$RANDOM"
+DUMP_CONTAINER="pg_dump_container_$RANDOM"
+DUMP_VOLUME="pg_dump_volume_$RANDOM"
+
+# Paths inside dump container
+DB_DUMP_FILE="/dump/db_dump.sql"
+GLOBAL_DUMP_FILE="/dump/globals.sql"
+
+# --- Helper functions --------------------------------------------------------
+
+die() { log "Error: $*"; exit 1; }
+
+# Cleanup function runs on EXIT (normal or error)
 cleanup() {
-    log "Cleaning up resources..."
-    docker stop $OLD_PG_CONTAINER $NEW_PG_CONTAINER $DUMP_CONTAINER 2>/dev/null || true
-    docker rm $OLD_PG_CONTAINER $NEW_PG_CONTAINER $DUMP_CONTAINER 2>/dev/null || true
-    docker volume rm $DUMP_VOLUME 2>/dev/null || true
-    docker network rm $NETWORK_NAME 2>/dev/null || true
+  log "Cleaning up Docker containers, network, and temp files..."
+  docker stop "$OLD_PG_CONTAINER" "$NEW_PG_CONTAINER" "$DUMP_CONTAINER" >/dev/null 2>&1 || true
+  docker rm "$OLD_PG_CONTAINER" "$NEW_PG_CONTAINER" "$DUMP_CONTAINER" >/dev/null 2>&1 || true
+  docker volume rm "$DUMP_VOLUME" >/dev/null 2>&1 || true
+  docker network rm "$NETWORK_NAME" >/dev/null 2>&1 || true
+  [[ -d "$TEMP_DIR" ]] && rm -rf "$TEMP_DIR"
+  log "Cleanup completed."
+}
 
-    if [ -d "$TEMP_DIR" ]; then
-        rm -rf "$TEMP_DIR"
-        log "Temporary directory cleaned up."
+# Restores original data directory from backup (runs once if backup exists)
+restore_from_backup_once() {
+  if (( BACKUP_TAKEN == 1 )) && (( RESTORE_ATTEMPTED == 0 )); then
+    RESTORE_ATTEMPTED=1
+    log "Restoring data directory from backup..."
+    mkdir -p "$DATA_DIR"
+    # Remove all files in target dir, but keep directory itself
+    find "$DATA_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+    rsync -a --delete "$TEMP_DIR/pgdata/" "$DATA_DIR/" || die "Failed to restore from backup."
+    log "Data directory restored successfully."
+  fi
+}
+
+# Error handler (runs automatically on ERR)
+on_error() {
+  local exit_code=$?
+  local line=${BASH_LINENO[0]:-?}
+  log "A failure occurred near line $line. Starting rollback (if backup available)..."
+  restore_from_backup_once
+  exit $exit_code
+}
+
+# Wrapper for commands — stops script if command fails
+check_cmd() { "$@" || die "Command failed: $*"; }
+
+# Waits for PostgreSQL container to be ready using pg_isready
+wait_for_pg() {
+  local container="$1" user="$2" retries=20 delay=3
+  log "Waiting for PostgreSQL in container '$container' to start..."
+  for ((i=1;i<=retries;i++)); do
+    if docker exec -i "$container" pg_isready -U "$user" >/dev/null 2>&1; then
+      log "PostgreSQL in '$container' is ready."
+      return 0
     fi
-    log "Cleanup completed."
-    exit 0
+    sleep "$delay"
+  done
+  die "PostgreSQL in '$container' failed to start after $((retries*delay)) seconds."
 }
 
-# Restore the data directory from the temporary backup
-restore_data_directory() {
-    if [ -d "$TEMP_DIR" ]; then
-        log "Restoring data directory from backup..."
-        rm -rf "$DATA_DIR"/*
-        cp -a "$TEMP_DIR"/* "$DATA_DIR/"
-        check_success "Failed to restore the data directory from the backup."
-        log "Data directory restored successfully."
-    else
-        log "Temporary directory not found. Skipping data restoration."
-    fi
-}
+# --- Traps -------------------------------------------------------------------
+trap on_error ERR
+trap cleanup EXIT
 
-# Trap errors and script exit to perform cleanup and data restoration
-trap 'restore_data_directory; cleanup' EXIT ERR SIGINT SIGTERM
+# --- Main script logic -------------------------------------------------------
 
-# Wait until PostgreSQL container is ready
-wait_for_postgres_ready() {
-    local container_name=$1
-    local retries=10
-    local wait_time=3
-    local attempt=0
+log "Starting PostgreSQL upgrade script..."
 
-    log "Waiting for PostgreSQL container '$container_name' to be ready..."
-    until docker exec -i $container_name pg_isready -U $POSTGRES_USER > /dev/null 2>&1; do
-        attempt=$((attempt+1))
-        if [ $attempt -ge $retries ]; then
-            log "PostgreSQL container '$container_name' is not ready after $retries attempts."
-            restore_data_directory
-            exit 1
-        fi
-        sleep $wait_time
-    done
-    log "PostgreSQL container '$container_name' is ready."
-}
-
-# Get script parameters
-DATA_DIR=$1
-CURR_PG_VERSION=$2
-NEW_PG_VERSION=$3
-TEMP_DIR=$(mktemp -d)
-
-log "Starting PostgreSQL upgrade script."
-
-# Ensure the script is run as root or with sudo
-if [ "$EUID" -ne 0 ]; then
-    log "Please run this script as root or use sudo."
-    exit 1
+# Must be root or use sudo to ensure file and Docker access
+if [[ "$EUID" -ne 0 ]]; then
+  die "Please run this script as root or with sudo."
 fi
 
-# Validate required parameters
-if [ -z "$DATA_DIR" ] || [ -z "$CURR_PG_VERSION" ] || [ -z "$NEW_PG_VERSION" ]; then
-    log "Usage: $0 <path_to_data_directory> <current_postgres_version> <new_postgres_version>"
-    exit 1
+# Validate arguments
+if [[ -z "$DATA_DIR" || -z "$CURR_PG_VERSION" || -z "$NEW_PG_VERSION" ]]; then
+  die "Usage: $0 <path_to_data_directory> <current_pg_version> <new_pg_version>"
 fi
 
-# Load environment variables from .env file
-if [ ! -f ".env" ]; then
-    log "Error: .env file not found. Please provide the file with POSTGRES_USER, POSTGRES_PASSWORD, and POSTGRES_DB variables."
-    exit 1
+# Ensure data directory exists
+[[ -d "$DATA_DIR" ]] || die "Data directory '$DATA_DIR' not found."
+
+# Load environment variables from .env (required for DB credentials)
+if [[ ! -f ".env" ]]; then
+  die ".env file not found in $(pwd). Expected POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB."
 fi
 
 log "Loading .env file..."
 set -o allexport
+# shellcheck disable=SC1091
 source .env
 set +o allexport
-check_success "Failed to load .env file."
 
-# Validate environment variables
-if [ -z "$POSTGRES_USER" ] || [ -z "$POSTGRES_PASSWORD" ] || [ -z "$POSTGRES_DB" ]; then
-    log "Error: Required variables POSTGRES_USER, POSTGRES_PASSWORD, or POSTGRES_DB are missing in the .env file."
-    exit 1
-fi
+# Ensure required variables are loaded
+[[ -n "${POSTGRES_USER:-}" && -n "${POSTGRES_PASSWORD:-}" && -n "${POSTGRES_DB:-}" ]] \
+  || die "Missing one or more required vars: POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB"
 
-# Set container, volume, and network names
-NETWORK_NAME="pg_upgrade_net"
-OLD_PG_CONTAINER="pg_old_$CURR_PG_VERSION"
-NEW_PG_CONTAINER="pg_new_$NEW_PG_VERSION"
-DUMP_CONTAINER="pg_dump_container"
-DUMP_VOLUME="pg_dump_volume"
-DB_DUMP_FILE="/dump/db_dump.sql"
+# Check Docker is installed and running
+command -v docker >/dev/null 2>&1 || die "Docker command not found."
+check_cmd docker info >/dev/null 2>&1
 
-# Step 1: Backup data directory
-log "Backing up data directory to a temporary location..."
-cp -a "$DATA_DIR"/* "$TEMP_DIR/"
-check_success "Failed to backup the data directory."
+# Pull required PostgreSQL Docker images
+log "Pulling docker images for PostgreSQL $CURR_PG_VERSION and $NEW_PG_VERSION..."
+check_cmd docker pull "postgres:${CURR_PG_VERSION}"
+check_cmd docker pull "postgres:${NEW_PG_VERSION}"
 
-# Step 2: Start old PostgreSQL container
-log "Starting PostgreSQL $CURR_PG_VERSION container..."
-docker network create $NETWORK_NAME
-check_success "Failed to create Docker network."
+# Step 1: Backup existing data safely
+log "Backing up existing PostgreSQL data..."
+mkdir -p "$TEMP_DIR/pgdata"
+# Use rsync to copy data safely (handles empty dirs gracefully)
+rsync -a --delete --ignore-missing-args "$DATA_DIR/" "$TEMP_DIR/pgdata/"
+BACKUP_TAKEN=1
+log "Backup completed and stored in $TEMP_DIR/pgdata"
 
-docker run -d --name $OLD_PG_CONTAINER --network $NETWORK_NAME \
-    -v "$DATA_DIR:/var/lib/postgresql/data" \
-    -e POSTGRES_USER=$POSTGRES_USER \
-    -e POSTGRES_PASSWORD=$POSTGRES_PASSWORD \
-    -e POSTGRES_DB=$POSTGRES_DB \
-    postgres:$CURR_PG_VERSION
-check_success "Failed to start PostgreSQL $CURR_PG_VERSION container."
+# Step 2: Create a temporary Docker network (isolates containers)
+log "Creating isolated Docker network for upgrade..."
+check_cmd docker network create "$NETWORK_NAME"
 
-# Step 3: Wait for PostgreSQL to be ready
-wait_for_postgres_ready $OLD_PG_CONTAINER
+# Step 3: Run the OLD Postgres container using the current data directory
+log "Starting old PostgreSQL $CURR_PG_VERSION container..."
+check_cmd docker run -d --name "$OLD_PG_CONTAINER" --network "$NETWORK_NAME" \
+  -v "$DATA_DIR:/var/lib/postgresql/data" \
+  -e POSTGRES_USER="$POSTGRES_USER" \
+  -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
+  -e POSTGRES_DB="$POSTGRES_DB" \
+  "postgres:${CURR_PG_VERSION}"
 
-# Step 4: Create Docker volume for dump
-log "Creating dump volume..."
-docker volume create $DUMP_VOLUME
-check_success "Failed to create dump volume."
+# Step 4: Wait for it to be ready
+wait_for_pg "$OLD_PG_CONTAINER" "$POSTGRES_USER"
 
-# Step 5: Start container for dump
-log "Starting container for database dump..."
-docker run -d --name $DUMP_CONTAINER --network $NETWORK_NAME \
-    -v $DUMP_VOLUME:/dump \
-    -e POSTGRES_PASSWORD=$POSTGRES_PASSWORD \
-    postgres:$NEW_PG_VERSION tail -f /dev/null
-check_success "Failed to start dump container."
+# Step 5: Create a volume to store dumps
+log "Creating Docker volume for dumps..."
+check_cmd docker volume create "$DUMP_VOLUME" >/dev/null
 
-# Step 6: Create database dump
-log "Creating a database dump..."
-docker exec -e PGPASSWORD=$POSTGRES_PASSWORD -i $DUMP_CONTAINER pg_dumpall -h $OLD_PG_CONTAINER -U $POSTGRES_USER -f $DB_DUMP_FILE
-check_success "Failed to create database dump."
+# Step 6: Run a helper (new version) container that will perform pg_dumpall
+log "Starting helper container for dumps..."
+check_cmd docker run -d --name "$DUMP_CONTAINER" --network "$NETWORK_NAME" \
+  -v "$DUMP_VOLUME:/dump" \
+  -e PGPASSWORD="$POSTGRES_PASSWORD" \
+  "postgres:${NEW_PG_VERSION}" tail -f /dev/null
 
-# Step 7: Stop and remove old PostgreSQL container
+# Step 7: Dump globals (roles, etc.) and all databases
+log "Dumping global roles and database data..."
+check_cmd docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" -i "$DUMP_CONTAINER" \
+  pg_dumpall -h "$OLD_PG_CONTAINER" -U "$POSTGRES_USER" -g -f "$GLOBAL_DUMP_FILE"
+
+check_cmd docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" -i "$DUMP_CONTAINER" \
+  pg_dumpall -h "$OLD_PG_CONTAINER" -U "$POSTGRES_USER" -f "$DB_DUMP_FILE"
+
+# Step 8: Stop and remove old container
 log "Stopping and removing old PostgreSQL container..."
-docker stop $OLD_PG_CONTAINER && docker rm $OLD_PG_CONTAINER
-check_success "Failed to stop and remove old PostgreSQL container."
+check_cmd docker stop "$OLD_PG_CONTAINER"
+check_cmd docker rm "$OLD_PG_CONTAINER"
 
-# Step 8: Clear old data directory
-log "Clearing old data directory contents..."
-rm -rf "$DATA_DIR"/*
-check_success "Failed to clear old data directory contents."
+# Step 9: Wipe the old data directory (keep mount point)
+log "Clearing old PostgreSQL data directory..."
+find "$DATA_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 
-# Step 9: Start new PostgreSQL container
-log "Starting PostgreSQL $NEW_PG_VERSION container..."
-docker run -d --name $NEW_PG_CONTAINER --network $NETWORK_NAME \
-    -v "$DATA_DIR:/var/lib/postgresql/data" \
-    -v $DUMP_VOLUME:/dump \
-    -e POSTGRES_USER=$POSTGRES_USER \
-    -e POSTGRES_PASSWORD=$POSTGRES_PASSWORD \
-    postgres:$NEW_PG_VERSION
-check_success "Failed to start PostgreSQL $NEW_PG_VERSION container."
+# Step 10: Start the NEW PostgreSQL container
+log "Starting new PostgreSQL $NEW_PG_VERSION container..."
+check_cmd docker run -d --name "$NEW_PG_CONTAINER" --network "$NETWORK_NAME" \
+  -v "$DATA_DIR:/var/lib/postgresql/data" \
+  -v "$DUMP_VOLUME:/dump" \
+  -e POSTGRES_USER="$POSTGRES_USER" \
+  -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
+  "postgres:${NEW_PG_VERSION}"
 
-# Step 10: Wait for new PostgreSQL to be ready
-wait_for_postgres_ready $NEW_PG_CONTAINER
+# Step 11: Wait until the new instance is ready
+wait_for_pg "$NEW_PG_CONTAINER" "$POSTGRES_USER"
 
-# Step 11: Restore database dump
-log "Restoring database dump into the new PostgreSQL instance..."
-docker exec -e PGPASSWORD=$POSTGRES_PASSWORD -i $NEW_PG_CONTAINER psql -U $POSTGRES_USER -f $DB_DUMP_FILE
-check_success "Failed to restore the database dump."
+# Step 12: Restore globals (roles, permissions) and database data
+log "Restoring global roles and permissions..."
+check_cmd docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" -i "$NEW_PG_CONTAINER" \
+  psql -U "$POSTGRES_USER" -f "$GLOBAL_DUMP_FILE"
 
-# Step 12: Reindex the database
-log "Reindexing the database..."
-docker exec -e PGPASSWORD=$POSTGRES_PASSWORD -i $NEW_PG_CONTAINER psql -U $POSTGRES_USER -c "REINDEX SYSTEM;"
-check_success "Failed to reindex the database."
+log "Restoring databases..."
+check_cmd docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" -i "$NEW_PG_CONTAINER" \
+  psql -U "$POSTGRES_USER" -f "$DB_DUMP_FILE"
 
-# Final log message
-log "PostgreSQL upgrade completed successfully."
-cleanup
+# Step 13: Reindex system catalogs for new version
+log "Reindexing system catalogs..."
+check_cmd docker exec -e PGPASSWORD="$POSTGRES_PASSWORD" -i "$NEW_PG_CONTAINER" \
+  psql -U "$POSTGRES_USER" -c "REINDEX SYSTEM;"
+
+log "✅ PostgreSQL upgrade completed successfully."
 exit 0
